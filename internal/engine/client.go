@@ -7,8 +7,16 @@ import (
 
 const UserAgent = "tako/0.1"
 
-func NewClient() *http.Client {
-	return &http.Client{}
+func NewClient(maxConns int) *http.Client {
+	return &http.Client{Transport: newTransport(maxConns)}
+}
+
+func newTransport(maxConns int) *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Protocols = new(http.Protocols)
+	t.Protocols.SetHTTP1(true)
+	t.MaxIdleConnsPerHost = max(maxConns, 1)
+	return t
 }
 
 func newRequest(ctx context.Context, rawURL string) (*http.Request, error) {

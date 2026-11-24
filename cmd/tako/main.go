@@ -52,7 +52,7 @@ func cmdInfo(ctx context.Context, args []string) error {
 		return fmt.Errorf("info takes one URL")
 	}
 
-	info, err := engine.Probe(ctx, engine.NewClient(), fs.Arg(0))
+	info, err := engine.Probe(ctx, engine.NewClient(*n), fs.Arg(0))
 	if err != nil {
 		return err
 	}
@@ -82,7 +82,7 @@ func cmdGet(ctx context.Context, args []string) error {
 		return fmt.Errorf("get takes one URL")
 	}
 
-	client := engine.NewClient()
+	client := engine.NewClient(1)
 	info, err := engine.Probe(ctx, client, fs.Arg(0))
 	if err != nil {
 		return err
