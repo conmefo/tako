@@ -8,12 +8,12 @@ import (
 	"os/signal"
 	"sync/atomic"
 
-	"github.com/conmefo/fast-download/internal/engine"
+	"github.com/conmefo/tako/internal/engine"
 )
 
 const usage = `usage:
-  fd info [-n N] URL         probe URL and show the download plan
-  fd get [-o FILE] URL       download URL
+  tako info [-n N] URL         probe URL and show the download plan
+  tako get [-o FILE] URL       download URL
 `
 
 func main() {

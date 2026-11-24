@@ -5,7 +5,7 @@ import (
 	"net/http"
 )
 
-const UserAgent = "fast-download/0.1"
+const UserAgent = "tako/0.1"
 
 func NewClient() *http.Client {
 	return &http.Client{}

@@ -1,4 +1,4 @@
-module github.com/conmefo/fast-download
+module github.com/conmefo/tako
 
 go 1.27.4
 
