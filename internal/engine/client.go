@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/tls"
 	"net/http"
 )
 
@@ -15,6 +16,10 @@ func newTransport(maxConns int) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.Protocols = new(http.Protocols)
 	t.Protocols.SetHTTP1(true)
+	if t.TLSClientConfig == nil {
+		t.TLSClientConfig = &tls.Config{}
+	}
+	t.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	t.MaxIdleConnsPerHost = max(maxConns, 1)
 	return t
 }

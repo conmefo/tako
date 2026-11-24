@@ -12,8 +12,8 @@ import (
 )
 
 const usage = `usage:
-  tako info [-n N] URL         probe URL and show the download plan
-  tako get [-o FILE] URL       download URL
+  tako info [-n N] URL           probe URL and show the download plan
+  tako get [-n N] [-o FILE] URL  download URL over N connections
 `
 
 func main() {
@@ -77,12 +77,13 @@ func cmdInfo(ctx context.Context, args []string) error {
 func cmdGet(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
 	out := fs.String("o", "", "output file (default: name from the server or URL)")
+	n := fs.Int("n", 4, "number of connections")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		return fmt.Errorf("get takes one URL")
 	}
 
-	client := engine.NewClient(1)
+	client := engine.NewClient(*n)
 	info, err := engine.Probe(ctx, client, fs.Arg(0))
 	if err != nil {
 		return err
@@ -91,11 +92,17 @@ func cmdGet(ctx context.Context, args []string) error {
 	if dst == "" {
 		dst = info.Filename
 	}
-	fmt.Fprintf(os.Stderr, "%s → %s\n", info.FinalURL, dst)
+	ranges := engine.Plan(info, *n)
+	fmt.Fprintf(os.Stderr, "%s → %s\n%s\n", info.FinalURL, dst, planText(info, ranges, *n))
 
 	var done atomic.Int64
+	onProgress := func(n int) { done.Add(int64(n)) }
 	stopProgress := startProgress(&done, info.Size)
-	err = engine.Download(ctx, client, info.FinalURL, dst, func(n int) { done.Add(int64(n)) })
+	if len(ranges) >= 2 {
+		err = engine.DownloadRanges(ctx, client, info, ranges, dst, onProgress)
+	} else {
+		err = engine.Download(ctx, client, info.FinalURL, dst, onProgress)
+	}
 	stopProgress()
 	return err
 }
