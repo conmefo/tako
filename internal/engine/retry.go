@@ -30,6 +30,7 @@ var DefaultRetry = RetryPolicy{
 type retryable struct {
 	err   error
 	after time.Duration
+	code  int
 }
 
 func (e *retryable) Error() string { return e.err.Error() }
@@ -91,9 +92,14 @@ func statusError(resp *http.Response) error {
 	err := fmt.Errorf("unexpected status: %s", resp.Status)
 	code := resp.StatusCode
 	if code == http.StatusTooManyRequests || code == http.StatusRequestTimeout || code >= 500 {
-		return &retryable{err: err, after: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
+		return &retryable{err: err, after: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()), code: code}
 	}
 	return err
+}
+
+func isThrottle(err error) bool {
+	var re *retryable
+	return errors.As(err, &re) && (re.code == http.StatusTooManyRequests || re.code == http.StatusServiceUnavailable)
 }
 
 func parseRetryAfter(h string, now time.Time) time.Duration {
