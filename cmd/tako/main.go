@@ -2,18 +2,25 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/conmefo/tako/internal/engine"
 )
 
 const usage = `usage:
-  tako info [-n N] URL           probe URL and show the download plan
-  tako get [-n N] [-o FILE] URL  download URL over N connections
+  tako info [-n N] URL                download plan for URL
+  tako get [-n N] [-o PATH] [-q] URL  download URL over N connections
+  tako version
+
+Interrupted downloads resume when you run the same command again.
 `
 
 func main() {
@@ -22,8 +29,12 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	var err error
 	switch os.Args[1] {
@@ -31,6 +42,9 @@ func main() {
 		err = cmdInfo(ctx, os.Args[2:])
 	case "get":
 		err = cmdGet(ctx, os.Args[2:])
+	case "version", "-v", "--version":
+		fmt.Println("tako", engine.Version)
+		return
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -39,6 +53,9 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			os.Exit(130)
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -76,17 +93,24 @@ func cmdInfo(ctx context.Context, args []string) error {
 
 func cmdGet(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
-	out := fs.String("o", "", "output file (default: name from the server or URL)")
+	out := fs.String("o", "", "output file or directory (default: name from the server or URL)")
 	n := fs.Int("n", 4, "number of connections")
+	quiet := fs.Bool("q", false, "no progress output, only errors")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		return fmt.Errorf("get takes one URL")
 	}
+	if *n < 1 || *n > 32 {
+		return fmt.Errorf("-n must be between 1 and 32")
+	}
+	say := func(format string, args ...any) {
+		if !*quiet {
+			fmt.Fprintf(os.Stderr, "\r\033[K"+format+"\n", args...)
+		}
+	}
 
 	client := engine.NewClient(*n)
-	client.Logf = func(format string, args ...any) {
-		fmt.Fprintf(os.Stderr, "\r\033[K"+format+"\n", args...)
-	}
+	client.Logf = say
 	info, err := engine.Probe(ctx, client, fs.Arg(0))
 	if err != nil {
 		return err
@@ -94,19 +118,35 @@ func cmdGet(ctx context.Context, args []string) error {
 	dst := *out
 	if dst == "" {
 		dst = info.Filename
+	} else if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
+		dst = filepath.Join(dst, info.Filename)
 	}
 	ranges := engine.Plan(info, *n)
-	fmt.Fprintf(os.Stderr, "%s → %s\n%s\n", info.FinalURL, dst, planText(info, ranges, *n))
+	say("%s → %s\n%s", info.FinalURL, dst, planText(info, ranges, *n))
 
 	var done atomic.Int64
 	onProgress := func(n int) { done.Add(int64(n)) }
-	stopProgress := startProgress(&done, info.Size)
-	if info.AcceptsRanges && len(ranges) >= 1 {
+	start := time.Now()
+	stopProgress := startProgress(&done, info.Size, *quiet)
+	resumable := info.AcceptsRanges && len(ranges) >= 1
+	if resumable {
 		err = engine.DownloadRanges(ctx, client, info, ranges, dst, onProgress)
 	} else {
 		err = engine.Download(ctx, client, info.FinalURL, dst, onProgress)
 	}
 	stopProgress()
+
+	switch {
+	case err == nil:
+		secs := time.Since(start).Seconds()
+		say("saved %s (%s) in %.1fs", dst, human(info.Size), secs)
+	case errors.Is(err, context.Canceled) && resumable:
+		say("interrupted; progress saved in %s.part.state, run the same command again to resume", dst)
+	case errors.Is(err, context.Canceled):
+		say("interrupted; this server doesn't support ranges, so the download can't resume")
+	case resumable:
+		return fmt.Errorf("%w\n(progress saved; run the same command again to resume)", err)
+	}
 	return err
 }
 

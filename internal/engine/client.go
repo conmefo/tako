@@ -8,7 +8,9 @@ import (
 	"time"
 )
 
-const UserAgent = "tako/0.1"
+const Version = "0.2.0"
+
+const UserAgent = "tako/" + Version
 
 type Client struct {
 	HTTP  *http.Client
