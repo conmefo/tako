@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"mime"
 	"net/http"
 	"net/url"
@@ -22,16 +21,29 @@ type FileInfo struct {
 	Filename      string
 }
 
-func Probe(ctx context.Context, client *http.Client, rawURL string) (FileInfo, error) {
-	req, err := newRequest(ctx, rawURL)
+func Probe(ctx context.Context, c *Client, rawURL string) (FileInfo, error) {
+	var info FileInfo
+	err := c.retry(ctx, "probe", func() (bool, error) {
+		var err error
+		info, err = probeOnce(ctx, c, rawURL)
+		return false, err
+	})
+	return info, err
+}
+
+func probeOnce(ctx context.Context, c *Client, rawURL string) (FileInfo, error) {
+	wd := newWatchdog(ctx, c.Retry.IdleTimeout)
+	defer wd.stop()
+
+	req, err := newRequest(wd.ctx, rawURL)
 	if err != nil {
 		return FileInfo{}, err
 	}
 	req.Header.Set("Range", "bytes=0-0")
 
-	resp, err := client.Do(req)
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return FileInfo{}, err
+		return FileInfo{}, wd.wrap(&retryable{err: err})
 	}
 	defer resp.Body.Close()
 
@@ -53,7 +65,7 @@ func Probe(ctx context.Context, client *http.Client, rawURL string) (FileInfo, e
 	case http.StatusRequestedRangeNotSatisfiable:
 		info.Size = 0
 	default:
-		return FileInfo{}, fmt.Errorf("probe %s: %s", rawURL, resp.Status)
+		return FileInfo{}, statusError(resp)
 	}
 
 	info.Filename = filenameFrom(resp.Header.Get("Content-Disposition"), resp.Request.URL, rawURL)

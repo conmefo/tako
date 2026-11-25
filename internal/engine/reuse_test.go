@@ -21,7 +21,7 @@ func TestProbeConnectionReused(t *testing.T) {
 	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
 		GotConn: func(i httptrace.GotConnInfo) { reused = append(reused, i.Reused) },
 	})
-	client := srv.Client()
+	client := testClient(srv.Client())
 	info, err := Probe(ctx, client, srv.URL+"/f.bin")
 	if err != nil {
 		t.Fatal(err)

@@ -84,6 +84,9 @@ func cmdGet(ctx context.Context, args []string) error {
 	}
 
 	client := engine.NewClient(*n)
+	client.Logf = func(format string, args ...any) {
+		fmt.Fprintf(os.Stderr, "\r\033[K"+format+"\n", args...)
+	}
 	info, err := engine.Probe(ctx, client, fs.Arg(0))
 	if err != nil {
 		return err
@@ -98,7 +101,7 @@ func cmdGet(ctx context.Context, args []string) error {
 	var done atomic.Int64
 	onProgress := func(n int) { done.Add(int64(n)) }
 	stopProgress := startProgress(&done, info.Size)
-	if len(ranges) >= 2 {
+	if info.AcceptsRanges && len(ranges) >= 1 {
 		err = engine.DownloadRanges(ctx, client, info, ranges, dst, onProgress)
 	} else {
 		err = engine.Download(ctx, client, info.FinalURL, dst, onProgress)

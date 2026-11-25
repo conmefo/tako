@@ -54,7 +54,7 @@ func TestDownloadRanges(t *testing.T) {
 			info := FileInfo{FinalURL: srv.URL + "/f.bin", Size: int64(len(body)), AcceptsRanges: true, ETag: `"v1"`}
 			dst := t.TempDir() + "/f.bin"
 			var done atomic.Int64
-			err := DownloadRanges(context.Background(), srv.Client(), info, splitN(info.Size, n), dst,
+			err := DownloadRanges(context.Background(), testClient(srv.Client()), info, splitN(info.Size, n), dst,
 				func(k int) { done.Add(int64(k)) })
 			if err != nil {
 				t.Fatal(err)
@@ -118,15 +118,9 @@ func TestDownloadRangesErrors(t *testing.T) {
 		{
 			name: "short body",
 			handler: func(w http.ResponseWriter, r *http.Request) {
-				var rs Range
-				for _, x := range splitN(size, 2) {
-					if r.Header.Get("Range") == rangeHeader(x) {
-						rs = x
-					}
-				}
+				rs := requestedRange(r)
 				w.Header().Set("Content-Range", contentRange(rs, size))
 				w.WriteHeader(http.StatusPartialContent)
-				w.Write(body[rs.Start : rs.Start+rs.Len()/2])
 			},
 			wantErr: "expected",
 		},
@@ -145,7 +139,7 @@ func TestDownloadRangesErrors(t *testing.T) {
 
 			info := FileInfo{FinalURL: srv.URL + "/f.bin", Size: size, AcceptsRanges: true, ETag: tt.etag}
 			dst := t.TempDir() + "/f.bin"
-			err := DownloadRanges(context.Background(), srv.Client(), info, splitN(size, 2), dst, nil)
+			err := DownloadRanges(context.Background(), testClient(srv.Client()), info, splitN(size, 2), dst, nil)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("err = %v, want one containing %q", err, tt.wantErr)
 			}
@@ -185,7 +179,7 @@ func TestDownloadRangesCancelsOthers(t *testing.T) {
 	info := FileInfo{FinalURL: srv.URL, Size: size, AcceptsRanges: true}
 	errc := make(chan error, 1)
 	go func() {
-		errc <- DownloadRanges(context.Background(), srv.Client(), info, splitN(size, 2), t.TempDir()+"/f", nil)
+		errc <- DownloadRanges(context.Background(), testClient(srv.Client()), info, splitN(size, 2), t.TempDir()+"/f", nil)
 	}()
 	select {
 	case err := <-errc:

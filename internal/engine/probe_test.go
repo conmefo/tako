@@ -109,7 +109,7 @@ func TestProbe(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			info, err := Probe(context.Background(), srv.Client(), srv.URL+tt.path)
+			info, err := Probe(context.Background(), testClient(srv.Client()), srv.URL+tt.path)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("want error, got %+v", info)
@@ -157,7 +157,7 @@ func TestProbeFollowsRedirect(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	info, err := Probe(context.Background(), srv.Client(), srv.URL+"/releases/latest/app.tar.gz")
+	info, err := Probe(context.Background(), testClient(srv.Client()), srv.URL+"/releases/latest/app.tar.gz")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -51,7 +51,7 @@ func TestNewClientOneConnectionPerRange(t *testing.T) {
 	defer srv.Close()
 
 	client := NewClient(n)
-	client.Transport.(*http.Transport).TLSClientConfig.RootCAs = srv.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	client.HTTP.Transport.(*http.Transport).TLSClientConfig.RootCAs = srv.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
 
 	info := FileInfo{FinalURL: srv.URL + "/f.bin", Size: int64(len(body)), AcceptsRanges: true}
 	dst := t.TempDir() + "/f.bin"
@@ -83,7 +83,7 @@ func TestNewClientOneConnectionPerRange(t *testing.T) {
 		}
 		req.Header.Set("Range", "bytes=0-0")
 		go func() {
-			resp, err := client.Do(req)
+			resp, err := client.HTTP.Do(req)
 			if err == nil {
 				resp.Body.Close()
 			}

@@ -3,13 +3,24 @@ package engine
 import (
 	"context"
 	"crypto/tls"
+	"net"
 	"net/http"
+	"time"
 )
 
 const UserAgent = "tako/0.1"
 
-func NewClient(maxConns int) *http.Client {
-	return &http.Client{Transport: newTransport(maxConns)}
+type Client struct {
+	HTTP  *http.Client
+	Retry RetryPolicy
+	Logf  func(format string, args ...any)
+}
+
+func NewClient(maxConns int) *Client {
+	return &Client{
+		HTTP:  &http.Client{Transport: newTransport(maxConns)},
+		Retry: DefaultRetry,
+	}
 }
 
 func newTransport(maxConns int) *http.Transport {
@@ -21,7 +32,15 @@ func newTransport(maxConns int) *http.Transport {
 	}
 	t.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	t.MaxIdleConnsPerHost = max(maxConns, 1)
+	t.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = 10 * time.Second
 	return t
+}
+
+func (c *Client) logf(format string, args ...any) {
+	if c.Logf != nil {
+		c.Logf(format, args...)
+	}
 }
 
 func newRequest(ctx context.Context, rawURL string) (*http.Request, error) {

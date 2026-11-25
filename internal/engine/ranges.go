@@ -11,7 +11,7 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func DownloadRanges(ctx context.Context, client *http.Client, info FileInfo, ranges []Range, dst string, onProgress func(n int)) error {
+func DownloadRanges(ctx context.Context, c *Client, info FileInfo, ranges []Range, dst string, onProgress func(n int)) error {
 	if err := checkCoverage(ranges, info.Size); err != nil {
 		return err
 	}
@@ -29,7 +29,7 @@ func DownloadRanges(ctx context.Context, client *http.Client, info FileInfo, ran
 	g, gctx := errgroup.WithContext(ctx)
 	for _, r := range ranges {
 		g.Go(func() error {
-			return fetchRange(gctx, client, info, r, f, onProgress)
+			return fetchRange(gctx, c, info, r, f, onProgress)
 		})
 	}
 	err = g.Wait()
@@ -43,44 +43,56 @@ func DownloadRanges(ctx context.Context, client *http.Client, info FileInfo, ran
 	return os.Rename(part, dst)
 }
 
-func fetchRange(ctx context.Context, client *http.Client, info FileInfo, r Range, f io.WriterAt, onProgress func(int)) error {
-	req, err := newRequest(ctx, info.FinalURL)
+func fetchRange(ctx context.Context, c *Client, info FileInfo, r Range, f io.WriterAt, onProgress func(int)) error {
+	var got int64
+	return c.retry(ctx, fmt.Sprintf("range %d-%d", r.Start, r.End), func() (bool, error) {
+		n, err := fetchRangeOnce(ctx, c, info, Range{Start: r.Start + got, End: r.End}, f, onProgress)
+		got += n
+		return n > 0, err
+	})
+}
+
+func fetchRangeOnce(ctx context.Context, c *Client, info FileInfo, r Range, f io.WriterAt, onProgress func(int)) (int64, error) {
+	wd := newWatchdog(ctx, c.Retry.IdleTimeout)
+	defer wd.stop()
+
+	req, err := newRequest(wd.ctx, info.FinalURL)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", r.Start, r.End))
 	if v := ifRangeValidator(info); v != "" {
 		req.Header.Set("If-Range", v)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("range %d-%d: %w", r.Start, r.End, err)
+		return 0, wd.wrap(&retryable{err: err})
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
 	case http.StatusOK:
-		return fmt.Errorf("range %d-%d: server sent the whole file (200) instead of the range; the file may have changed", r.Start, r.End)
+		return 0, fmt.Errorf("server sent the whole file (200) instead of bytes %d-%d; the file may have changed", r.Start, r.End)
 	default:
-		return fmt.Errorf("range %d-%d: unexpected status: %s", r.Start, r.End, resp.Status)
+		return 0, statusError(resp)
 	}
 
 	cr := resp.Header.Get("Content-Range")
 	start, end, total, ok := parseContentRange(cr)
 	if !ok || start != r.Start || end != r.End || total != info.Size {
-		return fmt.Errorf("range %d-%d: server answered with Content-Range %q", r.Start, r.End, cr)
+		return 0, fmt.Errorf("asked for bytes %d-%d, server answered with Content-Range %q", r.Start, r.End, cr)
 	}
 
-	n, err := copyAt(f, r.Start, io.LimitReader(resp.Body, r.Len()), onProgress)
+	n, err := copyAt(f, r.Start, io.LimitReader(wd.reader(resp.Body), r.Len()), onProgress)
 	if err != nil {
-		return fmt.Errorf("range %d-%d: after %d bytes: %w", r.Start, r.End, n, err)
+		return n, wd.wrap(err)
 	}
 	if n != r.Len() {
-		return fmt.Errorf("range %d-%d: got %d bytes, expected %d", r.Start, r.End, n, r.Len())
+		return n, &retryable{err: fmt.Errorf("got %d bytes, expected %d", n, r.Len())}
 	}
-	return nil
+	return n, nil
 }
 
 func ifRangeValidator(info FileInfo) string {

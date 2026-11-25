@@ -9,40 +9,65 @@ import (
 	"os"
 )
 
-func Download(ctx context.Context, client *http.Client, rawURL, dst string, onProgress func(n int)) error {
-	req, err := newRequest(ctx, rawURL)
-	if err != nil {
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status: %s", resp.Status)
-	}
-	total := resp.ContentLength
-
+func Download(ctx context.Context, c *Client, rawURL, dst string, onProgress func(n int)) error {
 	part := dst + ".part"
 	f, err := os.Create(part)
 	if err != nil {
 		return err
 	}
 
-	n, copyErr := copyAt(f, 0, resp.Body, onProgress)
+	var got int64
+	err = c.retry(ctx, "download", func() (bool, error) {
+		if got > 0 {
+			if onProgress != nil {
+				onProgress(-int(got))
+			}
+			got = 0
+			if err := f.Truncate(0); err != nil {
+				return false, err
+			}
+		}
+		n, err := downloadOnce(ctx, c, rawURL, f, onProgress)
+		got = n
+		return n > 0, err
+	})
 	closeErr := f.Close()
-	if copyErr != nil {
-		return fmt.Errorf("after %d bytes: %w", n, copyErr)
+	if err == nil {
+		err = closeErr
 	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if total >= 0 && n != total {
-		return fmt.Errorf("size mismatch: got %d bytes, expected %d", n, total)
+	if err != nil {
+		os.Remove(part)
+		return err
 	}
 	return os.Rename(part, dst)
+}
+
+func downloadOnce(ctx context.Context, c *Client, rawURL string, f io.WriterAt, onProgress func(int)) (int64, error) {
+	wd := newWatchdog(ctx, c.Retry.IdleTimeout)
+	defer wd.stop()
+
+	req, err := newRequest(wd.ctx, rawURL)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, wd.wrap(&retryable{err: err})
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, statusError(resp)
+	}
+
+	n, err := copyAt(f, 0, wd.reader(resp.Body), onProgress)
+	if err != nil {
+		return n, wd.wrap(fmt.Errorf("after %d bytes: %w", n, err))
+	}
+	if resp.ContentLength >= 0 && n != resp.ContentLength {
+		return n, &retryable{err: fmt.Errorf("size mismatch: got %d bytes, expected %d", n, resp.ContentLength)}
+	}
+	return n, nil
 }
 
 func copyAt(f io.WriterAt, off int64, r io.Reader, onProgress func(int)) (int64, error) {
@@ -64,7 +89,7 @@ func copyAt(f io.WriterAt, off int64, r io.Reader, onProgress func(int)) (int64,
 			if errors.Is(rerr, io.EOF) {
 				return written, nil
 			}
-			return written, rerr
+			return written, &retryable{err: rerr}
 		}
 	}
 }
