@@ -13,7 +13,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var errYield = errors.New("worker gave its chunk back")
+var (
+	errYield     = errors.New("worker gave its chunk back")
+	errOverLimit = errors.New("more workers than the connection limit")
+)
 
 const growAfter = 15 * time.Second
 
@@ -27,6 +30,10 @@ type rangeDownload struct {
 }
 
 func DownloadRanges(ctx context.Context, c *Client, info FileInfo, ranges []Range, dst string, onProgress func(n int)) error {
+	return DownloadRangesLive(ctx, c, info, ranges, dst, onProgress, nil)
+}
+
+func DownloadRangesLive(ctx context.Context, c *Client, info FileInfo, ranges []Range, dst string, onProgress func(n int), live *Live) error {
 	if err := checkCoverage(ranges, info.Size); err != nil {
 		return err
 	}
@@ -37,6 +44,9 @@ func DownloadRanges(ctx context.Context, c *Client, info FileInfo, ranges []Rang
 		return err
 	}
 	d := &rangeDownload{c: c, info: info, f: f, t: newTracker(chunks, len(ranges)), statePath: statePath, onProgress: onProgress}
+	if live != nil {
+		live.attach(d.t)
+	}
 	if resumed := sumDone(chunks); resumed > 0 {
 		c.logf("resuming: %.1f%% already downloaded", float64(resumed)*100/float64(info.Size))
 		if onProgress != nil {
@@ -135,8 +145,12 @@ func (d *rangeDownload) coordinate(ctx context.Context, g *errgroup.Group) error
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
-		for d.t.spawn() {
-			g.Go(func() error { return d.worker(ctx) })
+		for {
+			id, ok := d.t.spawn()
+			if !ok {
+				break
+			}
+			g.Go(func() error { return d.worker(ctx, id) })
 		}
 		if d.t.finished() {
 			return nil
@@ -156,37 +170,50 @@ func (d *rangeDownload) coordinate(ctx context.Context, g *errgroup.Group) error
 	}
 }
 
-func (d *rangeDownload) worker(ctx context.Context) error {
+func (d *rangeDownload) worker(ctx context.Context, id int) error {
 	buf := make([]byte, 256<<10)
 	for {
-		ch := d.t.take()
+		ch := d.t.take(id)
 		if ch == nil {
 			return nil
 		}
-		err := d.fetchChunk(ctx, ch, buf)
+		err := d.fetchChunk(ctx, id, ch, buf)
 		if errors.Is(err, errYield) {
 			return nil
 		}
 		d.t.release(ch)
 		if err != nil {
+			d.t.leave(id)
 			return err
 		}
 	}
 }
 
-func (d *rangeDownload) fetchChunk(ctx context.Context, ch *chunk, buf []byte) error {
+func (d *rangeDownload) fetchChunk(ctx context.Context, id int, ch *chunk, buf []byte) error {
 	what := fmt.Sprintf("range %d-%d", ch.start, ch.end)
-	return d.c.retry(ctx, what, func() (bool, error) {
-		n, err := d.fetchOnce(ctx, ch, buf)
-		if err != nil && isThrottle(err) {
-			if limit, cut := d.t.throttled(time.Now()); cut {
-				d.c.logf("server is rate limiting: dropping to %d connections", limit)
+	wait := func(delay time.Duration, err error) { d.t.waiting(id, time.Now().Add(delay), err) }
+	return d.c.retryWith(ctx, what, wait, func() (bool, error) {
+		progressed := false
+		for {
+			d.t.connecting(id)
+			n, err := d.fetchOnce(ctx, ch, buf)
+			progressed = progressed || n > 0
+			if errors.Is(err, errOverLimit) {
+				if d.t.yield(id, ch) {
+					return progressed, errYield
+				}
+				continue
 			}
-			if d.t.yield(ch) {
-				return n > 0, errYield
+			if err != nil && isThrottle(err) {
+				if limit, cut := d.t.throttled(time.Now()); cut {
+					d.c.logf("server is rate limiting: dropping to %d connections", limit)
+				}
+				if d.t.yield(id, ch) {
+					return progressed, errYield
+				}
 			}
+			return progressed, err
 		}
-		return n > 0, err
 	})
 }
 
@@ -239,12 +266,15 @@ func (d *rangeDownload) fetchOnce(ctx context.Context, ch *chunk, buf []byte) (i
 					return got, err
 				}
 				got += allowed
-				complete := d.t.commit(ch, allowed)
+				complete, over := d.t.commit(ch, allowed)
 				if d.onProgress != nil {
 					d.onProgress(int(allowed))
 				}
 				if complete {
 					return got, nil
+				}
+				if over && allowed == int64(nr) {
+					return got, errOverLimit
 				}
 			}
 			if allowed < int64(nr) {

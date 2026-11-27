@@ -51,6 +51,10 @@ func (p RetryPolicy) delay(failures int, after time.Duration) time.Duration {
 }
 
 func (c *Client) retry(ctx context.Context, what string, attempt func() (progressed bool, err error)) error {
+	return c.retryWith(ctx, what, nil, attempt)
+}
+
+func (c *Client) retryWith(ctx context.Context, what string, onWait func(time.Duration, error), attempt func() (progressed bool, err error)) error {
 	p := c.Retry
 	limit := max(p.Attempts, 1)
 	failures := 0
@@ -78,6 +82,9 @@ func (c *Client) retry(ctx context.Context, what string, attempt func() (progres
 		}
 		d := p.delay(failures-1, re.after)
 		c.logf("%s: %v; retry %d/%d in %s", what, err, failures, limit-1, d.Round(time.Millisecond))
+		if onWait != nil {
+			onWait(d, err)
+		}
 		t := time.NewTimer(d)
 		select {
 		case <-ctx.Done():

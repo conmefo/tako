@@ -17,10 +17,13 @@ import (
 
 const usage = `usage:
   tako info [-n N] URL                download plan for URL
-  tako get [-n N] [-o PATH] [-q] URL  download URL over N connections
+  tako get [-n N] [-o PATH] [-q] [-plain] URL
+                                      download URL over N connections
   tako version
 
 Interrupted downloads resume when you run the same command again.
+In a terminal, get shows a live view: p pause, +/- connections, d details,
+l longer log, q save and quit. -plain shows a single progress line.
 `
 
 func main() {
@@ -96,12 +99,13 @@ func cmdGet(ctx context.Context, args []string) error {
 	out := fs.String("o", "", "output file or directory (default: name from the server or URL)")
 	n := fs.Int("n", 4, "number of connections")
 	quiet := fs.Bool("q", false, "no progress output, only errors")
+	plain := fs.Bool("plain", false, "one progress line instead of the dashboard")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		return fmt.Errorf("get takes one URL")
 	}
-	if *n < 1 || *n > 32 {
-		return fmt.Errorf("-n must be between 1 and 32")
+	if *n < 1 || *n > engine.MaxConns {
+		return fmt.Errorf("-n must be between 1 and %d", engine.MaxConns)
 	}
 	say := func(format string, args ...any) {
 		if !*quiet {
@@ -124,17 +128,22 @@ func cmdGet(ctx context.Context, args []string) error {
 	ranges := engine.Plan(info, *n)
 	say("%s → %s\n%s", info.FinalURL, dst, planText(info, ranges, *n))
 
-	var done atomic.Int64
-	onProgress := func(n int) { done.Add(int64(n)) }
 	start := time.Now()
-	stopProgress := startProgress(&done, info.Size, *quiet)
 	resumable := info.AcceptsRanges && len(ranges) >= 1
-	if resumable {
-		err = engine.DownloadRanges(ctx, client, info, ranges, dst, onProgress)
+	if resumable && !*quiet && useDash(*plain) {
+		err = runDash(ctx, client, info, ranges, dst)
+		client.Logf = say
 	} else {
-		err = engine.Download(ctx, client, info.FinalURL, dst, onProgress)
+		var done atomic.Int64
+		onProgress := func(n int) { done.Add(int64(n)) }
+		stopProgress := startProgress(&done, info.Size, *quiet)
+		if resumable {
+			err = engine.DownloadRanges(ctx, client, info, ranges, dst, onProgress)
+		} else {
+			err = engine.Download(ctx, client, info.FinalURL, dst, onProgress)
+		}
+		stopProgress()
 	}
-	stopProgress()
 
 	switch {
 	case err == nil:

@@ -240,11 +240,11 @@ func TestAdaptiveConnections(t *testing.T) {
 func TestTrackerSplitsLargestChunk(t *testing.T) {
 	tr := newTracker([]*chunk{{start: 0, end: 8*MinChunk - 1}, {start: 8 * MinChunk, end: 9*MinChunk - 1}}, 2)
 	tr.running = 2
-	a, b := tr.take(), tr.take()
+	a, b := tr.take(0), tr.take(1)
 	tr.commit(b, b.len())
 	tr.release(b)
 
-	s := tr.take()
+	s := tr.take(1)
 	if s == nil || s.start != 4*MinChunk || s.end != 8*MinChunk-1 || a.end != 4*MinChunk-1 {
 		t.Fatalf("split went wrong: a=%+v stolen=%+v", a, s)
 	}
@@ -252,7 +252,7 @@ func TestTrackerSplitsLargestChunk(t *testing.T) {
 		t.Errorf("victim may still write %d bytes, want %d", got, 4*MinChunk)
 	}
 	tr.reserve(s, int(3*MinChunk))
-	if x := tr.take(); x != nil {
+	if x := tr.take(2); x != nil {
 		t.Errorf("split off %+v though nothing has 2 × MinChunk unclaimed", x)
 	}
 }

@@ -13,21 +13,33 @@ type chunk struct {
 	done     int64
 	reserved int64
 	owned    bool
+	owner    int
 }
 
 func (c *chunk) len() int64       { return c.end - c.start + 1 }
 func (c *chunk) complete() bool   { return c.done >= c.len() }
 func (c *chunk) unclaimed() int64 { return c.end - (c.start + c.reserved) + 1 }
 
+type slot struct {
+	busy  bool
+	state WorkerState
+	bytes int64
+	until time.Time
+	err   string
+}
+
 type tracker struct {
-	mu       sync.Mutex
-	chunks   []*chunk
-	maxConns int
-	limit    int
-	running  int
-	lastCut  time.Time
-	lastGrow time.Time
-	changed  chan struct{}
+	mu        sync.Mutex
+	chunks    []*chunk
+	slots     []slot
+	maxConns  int
+	limit     int
+	running   int
+	retries   int
+	throttles int
+	lastCut   time.Time
+	lastGrow  time.Time
+	changed   chan struct{}
 }
 
 func newTracker(chunks []*chunk, maxConns int) *tracker {
@@ -64,41 +76,89 @@ func (t *tracker) victimLocked() *chunk {
 	return v
 }
 
-func (t *tracker) spawn() bool {
+func (t *tracker) spawn() (id int, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.running >= t.limit || !t.hasWorkLocked() {
-		return false
+		return -1, false
 	}
 	t.running++
-	return true
+	for i := range t.slots {
+		if !t.slots[i].busy {
+			t.slots[i].busy = true
+			return i, true
+		}
+	}
+	t.slots = append(t.slots, slot{busy: true})
+	return len(t.slots) - 1, true
 }
 
-func (t *tracker) take() *chunk {
+func (t *tracker) freeLocked(id int) {
+	if id >= 0 && id < len(t.slots) {
+		t.slots[id] = slot{bytes: t.slots[id].bytes}
+	}
+}
+
+func (t *tracker) setStateLocked(id int, s WorkerState) {
+	if id >= 0 && id < len(t.slots) {
+		t.slots[id].state = s
+		t.slots[id].until = time.Time{}
+	}
+}
+
+func (t *tracker) take(id int) *chunk {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.running > t.limit {
 		t.running--
+		t.freeLocked(id)
 		t.signal()
 		return nil
 	}
 	for _, c := range t.chunks {
 		if !c.owned && !c.complete() {
 			c.owned = true
+			c.owner = id
 			c.reserved = c.done
+			t.setStateLocked(id, WorkerConnecting)
 			return c
 		}
 	}
 	if v := t.victimLocked(); v != nil {
 		mid := v.start + v.reserved + v.unclaimed()/2
-		c := &chunk{start: mid, end: v.end, owned: true}
+		c := &chunk{start: mid, end: v.end, owned: true, owner: id}
 		v.end = mid - 1
 		t.chunks = append(t.chunks, c)
+		t.setStateLocked(id, WorkerConnecting)
 		return c
 	}
 	t.running--
+	t.freeLocked(id)
 	t.signal()
 	return nil
+}
+
+func (t *tracker) leave(id int) {
+	t.mu.Lock()
+	t.freeLocked(id)
+	t.mu.Unlock()
+}
+
+func (t *tracker) connecting(id int) {
+	t.mu.Lock()
+	t.setStateLocked(id, WorkerConnecting)
+	t.mu.Unlock()
+}
+
+func (t *tracker) waiting(id int, until time.Time, err error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.retries++
+	if id >= 0 && id < len(t.slots) {
+		t.slots[id].state = WorkerWaiting
+		t.slots[id].until = until
+		t.slots[id].err = err.Error()
+	}
 }
 
 func (t *tracker) release(c *chunk) {
@@ -109,7 +169,7 @@ func (t *tracker) release(c *chunk) {
 	t.signal()
 }
 
-func (t *tracker) yield(c *chunk) bool {
+func (t *tracker) yield(id int, c *chunk) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.running <= t.limit {
@@ -118,6 +178,7 @@ func (t *tracker) yield(c *chunk) bool {
 	c.owned = false
 	c.reserved = c.done
 	t.running--
+	t.freeLocked(id)
 	t.signal()
 	return true
 }
@@ -137,11 +198,17 @@ func (t *tracker) reserve(c *chunk, n int) int64 {
 	return allowed
 }
 
-func (t *tracker) commit(c *chunk, n int64) (complete bool) {
+func (t *tracker) commit(c *chunk, n int64) (complete, over bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	c.done += n
-	return c.complete()
+	if c.owned && c.owner >= 0 && c.owner < len(t.slots) {
+		s := &t.slots[c.owner]
+		s.bytes += n
+		s.state = WorkerDownloading
+		s.err = ""
+	}
+	return c.complete(), t.running > t.limit
 }
 
 func (t *tracker) throttled(now time.Time) (limit int, cut bool) {
@@ -152,7 +219,18 @@ func (t *tracker) throttled(now time.Time) (limit int, cut bool) {
 	}
 	t.lastCut = now
 	t.limit = max(1, t.limit/2)
+	t.throttles++
 	return t.limit, true
+}
+
+func (t *tracker) setLimit(n int) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n = min(max(n, 1), MaxConns)
+	t.limit = n
+	t.maxConns = n
+	t.signal()
+	return n
 }
 
 func (t *tracker) grow(now time.Time, calm time.Duration) (limit int, grew bool) {
@@ -186,4 +264,31 @@ func (t *tracker) snapshot() []savedChunk {
 	}
 	slices.SortFunc(out, func(a, b savedChunk) int { return cmp.Compare(a.Start, b.Start) })
 	return out
+}
+
+func (t *tracker) stats() Stats {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	s := Stats{
+		Limit:     t.limit,
+		Running:   t.running,
+		Retries:   t.retries,
+		Throttles: t.throttles,
+		Chunks:    make([]ChunkStat, len(t.chunks)),
+		Workers:   make([]WorkerStat, len(t.slots)),
+	}
+	for i, c := range t.chunks {
+		w := -1
+		if c.owned {
+			w = c.owner
+		}
+		s.Chunks[i] = ChunkStat{Start: c.start, End: c.end, Done: c.done, Worker: w}
+		s.Size += c.len()
+		s.Done += c.done
+	}
+	slices.SortFunc(s.Chunks, func(a, b ChunkStat) int { return cmp.Compare(a.Start, b.Start) })
+	for i, sl := range t.slots {
+		s.Workers[i] = WorkerStat{Busy: sl.busy, State: sl.state, Bytes: sl.bytes, Until: sl.until, Err: sl.err}
+	}
+	return s
 }
